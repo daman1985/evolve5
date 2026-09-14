@@ -31,6 +31,24 @@ Binaries: flac `/home/user/corpus/flacsrc/build/src/flac/flac`; wavpack
 `/home/user/corpus/wavpack/build/wavpack`; mac `/home/user/corpus/mac/build/mac`;
 sac `/home/user/corpus/sac/sac`.
 
+## B2. Corpus-wide head-to-head (CORPUS-NATURAL)
+`bench/headtohead.sh` over all 56 files. Competitors reject exotic formats, so totals are
+summed only over the **36-file common subset every codec handled** (22,547,363 bytes of
+input `.flac`). Coverage: wavpack 56/56, mac 36/56, sac 49/56.
+
+| Codec | Bytes | vs `flac -8` |
+|---|---:|---:|
+| `flac -8` (the input) | 22,547,363 | — |
+| `wavpack -hh` | 22,501,378 | −0.20 % |
+| `mac -c4000` (High) | 21,140,996 | −6.24 % |
+| `mac -c5000` (Insane) | 21,091,448 | −6.46 % |
+| `sac --normal` | 19,820,882 | **−12.09 %** |
+
+The corpus-wide gap is *wider* than the single-file probe in §B (−12.09 % vs −9.93 %), so
+the plan's 7 % target and 9.5 % stretch sit sensibly between Monkey's Audio Insane and Sac.
+Note `wavpack -hh` collapses to −0.20 % across the corpus — the −1.25 % in §B was one
+favourable file, which is exactly why per-file numbers are not quoted as results.
+
 ## C. Recipe cost — the price of byte-exactness
 From `flac --analyze` over 12 CORPUS-NATURAL files (874 frames, 1,748 subframes,
 51,194,160 payload bits): the non-residual data a recipe must carry — frame headers,
