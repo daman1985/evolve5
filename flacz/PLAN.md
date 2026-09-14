@@ -116,6 +116,21 @@ So: ~1.5 % is what exists today at this corner; ~8–11 % is demonstrably reacha
 difference is the headroom, and it is large enough that several rounds of iteration have
 something real to close.
 
+**Refined on CORPUS-NATURAL** (14 files, 7,255,497 bytes, all encoded with *reference*
+`flac -8` — i.e. what real files look like, not the deliberately-crippled stress files):
+
+| Option, applied to a real `flac -8` file | Δ | byte-exact restore? |
+|---|---:|:--:|
+| `xz -9e` over the `.flac` | −1.45 % | yes |
+| Python `lzma -9e` over the `.flac` | −1.45 % | yes |
+| `flac -8pe -A "tukey(0.5);partial_tukey(2);punchout_tukey(3)"` re-encode | **−0.10 %** | no |
+
+The last row is the one that settles it. Even the most exhaustive apodization search the
+reference encoder offers buys **0.10 %** on a file already at `-8`. FLAC's own model is
+saturated; there is nothing left inside it. Every one of the ~10 % that Sac and OptimFROG
+reach lies *outside* FLAC's model, and is today unreachable without destroying the file.
+That is precisely the space `flacz` occupies.
+
 The cost side is the "recipe" — the FLAC coding decisions needed for exact re-emission.
 Its size is the central engineering risk and the thing rounds must drive down. First-order
 estimate: a few hundred bits per frame against ~50,000 bits of payload, i.e. well under
