@@ -1,0 +1,5 @@
+flacz/flacz
+flacz/*.o
+flacz/src/*.o
+*.flz
+corpus/
