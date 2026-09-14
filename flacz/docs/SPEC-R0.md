@@ -330,7 +330,7 @@ de-correlation. Every subframe type contributes `blocksize` samples, including C
 
 This domain is chosen because it makes R0 exact by construction and because the wasted low
 zero bits are never stored. R2's predictor may prefer true L/R; the transform is exact and
-documented in §5.4, and switching domains is a `pcm_codec_id` change, not a container
+documented in §4.5, and switching domains is a `pcm_codec_id` change, not a container
 change.
 
 ### 3.8 `VERB` sub-stream, `codec_id 0`
@@ -427,6 +427,43 @@ are produced. The `rc_id` context tag on every `rxfer_*` call (§5.2) is the hoo
 
 ---
 
+### 4.5 The subframe-domain ↔ interleaved-PCM transform (for R2, not used in R0)
+
+R0's `PCM` stream is in the subframe domain (§3.7). A later `pcm_codec_id` may prefer true
+interleaved L/R. The transform is exact in both directions and uses only recipe fields, so
+it can live entirely inside `pcm_block` without touching the container. Recorded here so
+R2 does not have to re-derive it (and so it is reviewed once, not twice).
+
+Let `sig[ch][i]` be the subframe-domain value and `u[ch][i] = sig[ch][i] << wasted[ch]`.
+
+**Forward (what a FLAC decoder outputs):**
+
+| `channel_code` | L | R |
+|---|---|---|
+| 0..7 (independent) | `u[ch]` per channel | — |
+| 8 (left/side) | `u[0]` | `u[0] - u[1]` |
+| 9 (right/side) | `u[1] + u[0]` | `u[1]` |
+| 10 (mid/side) | `(t + u[1]) >> 1` where `t = (u[0] << 1) \| (u[1] & 1)` | `(t - u[1]) >> 1` |
+
+**Inverse (what `flac_subframe` needs):**
+
+| `channel_code` | `u[0]` | `u[1]` |
+|---|---|---|
+| 8 | `L` | `L - R` |
+| 9 | `L - R` | `R` |
+| 10 | `(L + R) >> 1` (arithmetic) | `L - R` |
+
+then `sig[ch] = u[ch] >> wasted[ch]`.
+
+The mid/side pair is exactly invertible: with `m = floor((L+R)/2)` and `s = L-R`,
+`(L+R)` and `s` have the same parity, so `t = 2m + (s & 1) = L + R` and the forward map
+returns `L` and `R` unchanged. All arithmetic is `int64_t`; `>>` is arithmetic. `u[1]` for
+a 32-bit stream needs 33 bits, which is why `sig[]` is `int64_t`.
+
+A codec working in the L/R domain must still right-shift by `wasted[ch]` at the end, and
+that shift is exact because the discarded bits are zero by construction (the FLAC decoder
+produced them by shifting left).
+
 ## 5. The shared walk
 
 ### 5.1 Direction
@@ -446,29 +483,38 @@ reason one function body can serve both passes.
 
 ```c
 typedef struct bitio bitio;   /* FLAC-side bit cursor + running CRC-8 and CRC-16 */
-typedef struct recio recio;   /* one .flz sub-stream: GEOM | PCM | CODE | VERB      */
-typedef enum { RC_BSCODE, RC_SRCODE, RC_CHCODE, RC_SSCODE, RC_NUMLEN, RC_NUMBYTE,
-               RC_BSEXT, RC_SREXT, RC_RESV, RC_KIND, RC_WASTEDFLAG, RC_WASTEDLEN,
-               RC_SFTYPE, RC_QLPPREC, RC_QLPSHIFT, RC_QLPCOEF, RC_RMETHOD,
-               RC_PARTORDER, RC_RPARAM, RC_ESCW, RC_RUNLEN, RC_NCTX } rc_id;
-
-/* ---- FLAC bitstream ---- */
-static inline void xfer_u   (bitio *b, dir_t d, uint32_t *v, int nbits);
-static inline void xfer_u64 (bitio *b, dir_t d, uint64_t *v, int nbits);
-static inline void xfer_s64 (bitio *b, dir_t d, int64_t  *v, int nbits); /* two's complement */
-static inline void xfer_unary(bitio *b, dir_t d, uint32_t *v);
-static inline void xfer_rice(bitio *b, dir_t d, int64_t *v, uint32_t k);
-static inline void xfer_bytes(bitio *b, dir_t d, uint8_t *p, size_t n);  /* byte-aligned */
-
-/* ---- .flz sub-streams: same `d`, inverted inside ---- */
-static inline void rxfer_u    (recio *r, dir_t d, uint32_t *v, int nbits, rc_id c);
-static inline void rxfer_u64  (recio *r, dir_t d, uint64_t *v, int nbits, rc_id c);
-static inline void rxfer_s64  (recio *r, dir_t d, int64_t  *v, int nbits, rc_id c);
-static inline void rxfer_vu   (recio *r, dir_t d, uint64_t *v, rc_id c);      /* varint */
-static inline void rxfer_bytes(recio *r, dir_t d, uint8_t *p, size_t n);
+typedef struct recio recio;   /* one .flz stream: META | GEOM | PCM | CODE | VERB */
+typedef enum { RC_META, RC_KIND, RC_RUNLEN, RC_BSCODE, RC_SRCODE, RC_CHCODE, RC_SSCODE,
+               RC_RESV, RC_NUMLEN, RC_NUMBYTE, RC_BSEXT, RC_SREXT, RC_WASTED,
+               RC_SFTYPE, RC_QLPPREC, RC_QLPSHIFT, RC_QLPCOEF,
+               RC_RMETHOD, RC_PARTORDER, RC_RPARAM, RC_ESCW, RC_NCTX } rc_id;
 ```
 
-Reference bodies (this is the whole of the direction-dependence in the project):
+**FLAC bitstream.** `nbits == 0` must be a legal no-op for all of these.
+
+```c
+static inline void xfer_u    (bitio *b, dir_t d, uint32_t *v, int nbits);
+static inline void xfer_u64  (bitio *b, dir_t d, uint64_t *v, int nbits);
+static inline void xfer_s64  (bitio *b, dir_t d, int64_t  *v, int nbits);  /* two's complement */
+static inline void xfer_unary(bitio *b, dir_t d, uint32_t *v);             /* v zeros, then a 1 */
+static inline void xfer_rice (bitio *b, dir_t d, int64_t  *v, uint32_t k);
+static inline void xfer_bytes(bitio *b, dir_t d, uint8_t  *p, size_t n);   /* byte-aligned */
+```
+
+**`.flz` streams.** Same `d`; the inversion happens inside.
+
+```c
+static inline void rxfer_u    (recio *r, dir_t d, uint32_t *v, int nbits, rc_id c);
+static inline void rxfer_u64  (recio *r, dir_t d, uint64_t *v, int nbits, rc_id c);
+static inline void rxfer_s    (recio *r, dir_t d, int32_t  *v, int nbits, rc_id c);
+static inline void rxfer_vu   (recio *r, dir_t d, uint64_t *v, rc_id c);   /* LEB128 varint */
+static inline void rxfer_bytes(recio *r, dir_t d, uint8_t  *p, size_t n, rc_id c);
+
+/* variable-length: flag bit, then 5 bits of (w-1) iff the flag is set (§4.1) */
+static inline void rxfer_wasted(recio *r, dir_t d, uint32_t *w, rc_id c);
+```
+
+Reference bodies. **This is the entire direction-dependence of the project:**
 
 ```c
 static inline void xfer_u(bitio *b, dir_t d, uint32_t *v, int nbits) {
@@ -481,28 +527,31 @@ static inline void rxfer_u(recio *r, dir_t d, uint32_t *v, int nbits, rc_id c) {
 }
 ```
 
-Three composite primitives sit on top. They exist so that *call sites* never branch:
+**Composites.** These exist so that no *call site* ever branches on direction.
 
 ```c
-/* (A) a field that is copied verbatim between the FLAC bitstream and a recipe sub-stream */
-static inline void carry_u(fctx *c, recio *r, uint32_t *v,
-                           int fbits, int rbits, rc_id id) {
-    if (c->d == DIR_READ) { xfer_u(c->fb, DIR_READ, v, fbits);
-                            rxfer_u(r, DIR_READ, v, rbits, id); }
-    else                  { rxfer_u(r, DIR_WRITE, v, rbits, id);
+/* (A) a field copied verbatim between the FLAC bitstream and a recipe stream. The whole
+       point is the source-then-sink ordering, which is opposite in the two passes.      */
+static inline void carry_u(fctx *c, recio *r, uint32_t *v, int fbits, int rbits, rc_id id) {
+    if (c->d == DIR_READ) { xfer_u(c->fb, DIR_READ,  v, fbits);
+                            rxfer_u(r,    DIR_READ,  v, rbits, id); }
+    else                  { rxfer_u(r,    DIR_WRITE, v, rbits, id);
                             xfer_u(c->fb, DIR_WRITE, v, fbits); }
 }
+static inline void carry_s    (fctx *c, recio *r, int32_t *v, int bits, rc_id id);   /* signed */
+static inline void carry_bytes(fctx *c, recio *r, uint8_t *p, size_t n, rc_id id);
 
 /* (B) a field present in the FLAC bitstream but NOT in the recipe: recomputed.
        On READ it is parsed and checked; a mismatch arms the fallback.
-       On WRITE the computed value is emitted. One call site, one expression. */
+       On WRITE the computed value is emitted. One call site, one expression.           */
 static inline void derive_u64(fctx *c, uint64_t computed, int nbits) {
     uint64_t v = computed;
     xfer_u64(c->fb, c->d, &v, nbits);
     if (c->d == DIR_READ && v != computed) c->fallback = 1;
 }
+static inline void derive_s64(fctx *c, int64_t computed, int nbits);   /* same, signed */
 
-/* (C) the predictor/residual coupling — see §5.5 */
+/* (C) the predictor/residual coupling (see §5.6) */
 static inline void xfer_pred_rice(fctx *c, int64_t *s, int64_t pred, uint32_t k) {
     int64_t e;
     if (c->d == DIR_WRITE) { e = *s - pred; xfer_rice(c->fb, DIR_WRITE, &e, k); }
@@ -513,11 +562,23 @@ static inline void xfer_pred_raw(fctx *c, int64_t *s, int64_t pred, int rawbits)
     if (c->d == DIR_WRITE) { e = *s - pred; if (rawbits) xfer_s64(c->fb, DIR_WRITE, &e, rawbits); }
     else                   { if (rawbits) xfer_s64(c->fb, DIR_READ, &e, rawbits); *s = e + pred; }
 }
+
+/* (D) the wasted-bits flag + unary count. The VALUE lives in ctx (it is carried to GEOM
+       by sig_pre/sig_post, §5.7); here only the FLAC-side encoding is transferred.
+       Note there is no `if (d ...)` at all: both reads are out-params.                  */
+static inline void xfer_wasted(fctx *c, uint32_t *w) {
+    uint32_t flag = (*w != 0);
+    xfer_u(c->fb, c->d, &flag, 1);            /* READ overwrites flag; WRITE emits it   */
+    if (flag) { uint32_t u = *w ? *w - 1 : 0;
+                xfer_unary(c->fb, c->d, &u);  /* READ overwrites u;    WRITE emits it   */
+                *w = u + 1; }
+    else *w = 0;
+}
 ```
 
-**These eight functions (`xfer_*`, `rxfer_*`, `carry_*`, `derive_*`, `xfer_pred_*`) plus
-`pcm_pre`/`pcm_post` in §5.6 are the complete sanctioned set. A direction test anywhere
-else is a defect (PLAN §2.5).**
+**The sanctioned set is exactly: `xfer_*`, `rxfer_*`, `carry_*`, `derive_*`,
+`xfer_pred_*`, `xfer_wasted`, and the `sig_pre` / `sig_post` pair of §5.7. A direction test
+anywhere else in the codebase is a defect (PLAN §2.5) even if every test passes.**
 
 ### 5.3 Context
 
@@ -525,84 +586,102 @@ else is a defect (PLAN §2.5).**
 typedef struct {
     dir_t     d;
     bitio    *fb;
-    recio    *geom, *pcm, *code, *verb;
+    recio    *meta, *geom, *pcm, *code, *verb;
 
     int       has_streaminfo;
     uint32_t  si_bps, si_sample_rate, si_min_bs, si_max_bs;
-    int       number_is_sample_number;   /* B==1 || (has_streaminfo && min!=max) — prediction only */
-
+    int       number_is_sample_number;   /* B==1 || (has_streaminfo && min!=max); prediction only */
+    uint32_t  meta_avail;                /* DIR_READ: bytes left in the metadata region;
+                                            DIR_WRITE: UINT32_MAX                        */
     /* per-frame */
     uint32_t  blocksize, channels, frame_bps, channel_code;
     uint32_t  wasted[8];
-    int64_t  *sig[8];                    /* 8 x 65536 int64 = 4 MiB, allocated once */
+    int64_t  *sig[8];                    /* 8 x 65536 int64 = 4 MiB, allocated once      */
 
     uint64_t  prev_number; uint32_t prev_blocksize;   /* prediction only */
     int       fallback;
 } fctx;
 
-typedef struct { uint32_t order; int is_lpc; uint32_t prec, shift; int32_t qlp[32]; } pred_t;
+typedef struct { uint32_t order; int is_lpc, prec, shift; int32_t qlp[32]; } pred_t;
+
+static inline uint32_t side_extra(const fctx *c, uint32_t ch) {
+    return ((c->channel_code == 8  && ch == 1) ||
+            (c->channel_code == 9  && ch == 0) ||
+            (c->channel_code == 10 && ch == 1)) ? 1u : 0u;
+}
+static inline uint32_t sub_bps(const fctx *c, uint32_t ch) {    /* BEFORE wasted-bit reduction */
+    return c->frame_bps + side_extra(c, ch);
+}
+static inline uint32_t bps_eff(const fctx *c, uint32_t ch) {    /* AFTER  wasted-bit reduction */
+    return sub_bps(c, ch) - c->wasted[ch];
+}
 ```
 
 ### 5.4 Structural functions
 
 ```c
-bool flacz_stream        (fctx *c);                     /* whole file: sections + record loop */
-bool flac_metadata_block (fctx *c);                     /* one metadata block, both directions  */
-bool flac_record         (fctx *c);                     /* GEOM kind dispatch                   */
-bool flac_frame          (fctx *c);                     /* one parsed frame, header..CRC-16     */
+bool flacz_stream        (fctx *c);                  /* sections + the record loop         */
+bool flac_metadata_block (fctx *c);                  /* one metadata block; returns last-flag */
+bool flac_record         (fctx *c);                  /* GEOM `kind` dispatch               */
+bool flac_frame          (fctx *c);                  /* one parsed frame, sync .. CRC-16   */
 bool flac_frame_header   (fctx *c);
-bool flac_subframe       (fctx *c, uint32_t ch, uint32_t bps);
+bool flac_subframe       (fctx *c, uint32_t ch);
 bool flac_residual       (fctx *c, int64_t *s, uint32_t blocksize, const pred_t *p);
+void sig_xfer            (fctx *c);                  /* wasted[] + all channels of PCM     */
 void pcm_block           (fctx *c, uint32_t ch, uint32_t bps_eff);
 static inline int64_t predict(const pred_t *p, const int64_t *s, uint32_t i);  /* ONE copy */
 ```
 
-`flac_metadata_block` is genuinely symmetric and needs no special handling:
+`flac_metadata_block` is genuinely symmetric:
 
 ```c
 bool flac_metadata_block(fctx *c) {
     uint32_t hdr, declared, stored;
-    carry_u(c, c->meta, &hdr,      8, 8,  RC_META);      /* last<<7 | type */
-    carry_u(c, c->meta, &declared,24,24,  RC_META);
-    stored = min(declared, bytes_remaining_to_first_record(c));
+    carry_u(c, c->meta, &hdr,      8,  8, RC_META);        /* last_flag<<7 | type */
+    carry_u(c, c->meta, &declared, 24, 24, RC_META);
+    stored = declared < c->meta_avail ? declared : c->meta_avail;  /* DIR_WRITE: == declared,
+                                                   and the rxfer below overwrites it anyway */
     rxfer_u(c->meta, c->d, &stored, 24, RC_META);
-    xfer_bytes(c->fb, c->d, body, stored);               /* body is carried, not derived */
-    rxfer_bytes(c->meta, c->d, body, stored);
-    return (hdr >> 7) != 0;                              /* last-block flag */
+    carry_bytes(c, c->meta, body, stored, RC_META);
+    c->meta_avail -= 4 + stored;
+    return (hdr >> 7) != 0;
 }
 ```
-(The `body` transfer is two calls rather than a `carry_bytes` only because the two sides use
-different cursors; order them exactly as `carry_u` does — FLAC-side first on `DIR_READ`.)
 
 ### 5.5 How one body serves both directions
 
-`flac_subframe` is the interesting case. Every line below runs identically in both passes:
-
 ```c
-bool flac_subframe(fctx *c, uint32_t ch, uint32_t bps) {
-    uint32_t pad = 0, t, wf, wm1 = 0;
-    derive_u64(c, 0, 1);                                /* the mandatory 0 pad bit        */
-    carry_u(c, c->code, &t,  6, 6, RC_SFTYPE);          /* type code                      */
-    carry_u(c, c->geom, &wf, 1, 1, RC_WASTEDFLAG);      /* wasted flag lives in GEOM      */
-    if (wf) { unary_carry(c, c->geom, &wm1, RC_WASTEDLEN); bps -= (c->wasted[ch] = wm1 + 1); }
-    else      c->wasted[ch] = 0;
-
+bool flac_subframe(fctx *c, uint32_t ch) {
+    uint32_t t, bps = sub_bps(c, ch), i, j;
     int64_t *s = c->sig[ch];
-    switch (classify(t)) {
-    case SF_CONSTANT:                                   /* value == s[0], derived        */
-        derive_s64(c, s[0], bps);
+
+    derive_u64(c, 0, 1);                                  /* mandatory 0 pad bit         */
+    carry_u(c, c->code, &t, 6, 6, RC_SFTYPE);             /* type code                   */
+    xfer_wasted(c, &c->wasted[ch]);                       /* FLAC-side encoding only     */
+    if (c->wasted[ch] >= bps) { c->fallback = 1; return false; }
+    bps -= c->wasted[ch];
+
+    switch (classify(t)) {                                /* §2.4; reserved => fallback  */
+    case SF_CONSTANT:
+        derive_s64(c, s[0], bps);                         /* value IS s[0]               */
         break;
     case SF_VERBATIM:
-        for (i = 0; i < c->blocksize; i++) xfer_s64(c->fb, c->d, &s[i], bps);
+        for (i = 0; i < c->blocksize; i++)
+            xfer_s64(c->fb, c->d, &s[i], bps);            /* same call both directions   */
         break;
     case SF_FIXED: case SF_LPC: {
-        pred_t p = {...};
-        for (i = 0; i < p.order; i++) xfer_s64(c->fb, c->d, &s[i], bps);   /* warm-ups    */
+        pred_t p = { .order = order_of(t), .is_lpc = is_lpc(t) };
+        for (i = 0; i < p.order; i++)
+            xfer_s64(c->fb, c->d, &s[i], bps);            /* warm-ups ARE samples        */
         if (p.is_lpc) {
-            carry_u(c, c->code, &p.prec_m1, 4, 4, RC_QLPPREC);
-            carry_u(c, c->code, &p.shift,   5, 5, RC_QLPSHIFT);
+            uint32_t pm1;
+            carry_u(c, c->code, &pm1,     4, 4, RC_QLPPREC);
+            if (pm1 == 15) { c->fallback = 1; return false; }
+            p.prec = pm1 + 1;
+            carry_u(c, c->code, &p.shift, 5, 5, RC_QLPSHIFT);   /* 5-bit signed field;
+                                                        a negative value => fallback     */
             for (j = 0; j < p.order; j++)
-                carry_s(c, c->code, &p.qlp[j], p.prec_m1+1, p.prec_m1+1, RC_QLPCOEF);
+                carry_s(c, c->code, &p.qlp[j], p.prec, RC_QLPCOEF);
         }
         flac_residual(c, s, c->blocksize, &p);
         break; }
@@ -611,29 +690,34 @@ bool flac_subframe(fctx *c, uint32_t ch, uint32_t bps) {
 }
 ```
 
-Note what happens at the warm-up loop: `xfer_s64(c->fb, c->d, &s[i], bps)` **is the same
-call in both directions**, because a warm-up sample *is* a sample. On `DIR_READ` it fills
-`s[i]` from the bitstream; on `DIR_WRITE` it emits the `s[i]` that `pcm_block` already
-loaded. No recipe entry, no branch. The same is true of VERBATIM samples, and CONSTANT's
-value is a `derive_*`.
+Three things to notice, because they are why this works at all:
+
+- **Warm-ups and VERBATIM samples need no recipe entry and no branch.** A warm-up *is* a
+  sample. `xfer_s64(c->fb, c->d, &s[i], bps)` fills `s[i]` from the bitstream on `DIR_READ`
+  and emits the `s[i]` that `sig_xfer` already loaded on `DIR_WRITE`. Same line.
+- **CONSTANT's value is a `derive_*`,** because it is `s[0]` by construction.
+- **Every encoder *decision*** (type, precision, shift, coefficients, Rice parameters) goes
+  through `carry_*`, i.e. it round-trips through `CODE`. Every *consequence* of those
+  decisions goes through `derive_*` or `xfer_pred_*`.
 
 ### 5.6 The residual asymmetry, and why it is still one walk
 
 Parsing reads residuals and reconstructs samples; emitting knows samples and recomputes
 residuals. These are not two algorithms — they are the same recurrence solved for different
-unknowns, around a predictor that is identical:
+unknowns, around a predictor that is identical.
 
 ```c
 bool flac_residual(fctx *c, int64_t *s, uint32_t bs, const pred_t *p) {
-    uint32_t m, po, k, param, rw, i, n, first;
+    uint32_t m, po, k, param, rw, i, n;
     carry_u(c, c->code, &m,  2, 2, RC_RMETHOD);
+    if (m > 1) { c->fallback = 1; return false; }
     carry_u(c, c->code, &po, 4, 4, RC_PARTORDER);
-    if ((bs & ((1u<<po)-1)) || ((bs>>po) < p->order)) { c->fallback = 1; return false; }
-    int plen = m ? 5 : 4, esc = (1<<plen)-1;
+    if ((bs & ((1u << po) - 1)) || ((bs >> po) < p->order)) { c->fallback = 1; return false; }
+    const int plen = m ? 5 : 4, esc = (1 << plen) - 1;
     i = p->order;
-    for (k = 0; k < (1u<<po); k++) {
+    for (k = 0; k < (1u << po); k++) {
         carry_u(c, c->code, &param, plen, plen, RC_RPARAM);
-        n = (k == 0) ? (bs>>po) - p->order : (bs>>po);
+        n = (k == 0) ? (bs >> po) - p->order : (bs >> po);
         if (param == esc) {
             carry_u(c, c->code, &rw, 5, 5, RC_ESCW);
             for (; n--; i++) xfer_pred_raw (c, &s[i], predict(p, s, i), rw);
@@ -646,46 +730,61 @@ bool flac_residual(fctx *c, int64_t *s, uint32_t bs, const pred_t *p) {
 ```
 
 `predict()` — the expensive, bug-prone part — exists in exactly one copy and is called
-identically in both passes. The direction shows up only inside `xfer_pred_*`, which is one
-of the sanctioned primitives. The reconstruction `s[i] = e + pred` and the computation
-`e = s[i] - pred` are two lines of one function, not two functions.
+identically in both passes. The direction shows up only inside `xfer_pred_*`. The
+reconstruction `s[i] = e + pred` and the computation `e = s[i] - pred` are two lines of one
+function, not two functions.
 
 This works because the recurrence is **causal**: `predict(p, s, i)` reads only
 `s[i-order .. i-1]`, which are already final in both directions — on `DIR_READ` because
-earlier iterations wrote them, on `DIR_WRITE` because `pcm_block` loaded the whole block.
+earlier iterations wrote them, on `DIR_WRITE` because `sig_xfer` loaded the whole block
+before the walk began.
 
 ### 5.7 The one scheduling asymmetry — stated plainly
 
 Sample data must exist *before* `flac_subframe` runs under `DIR_WRITE`, and only exists
-*after* it runs under `DIR_READ`. There is no way to make that symmetric, because the
-dependency genuinely points in opposite directions. It is handled by a matched pair of
-one-line primitives at the frame level:
+*after* it runs under `DIR_READ`. There is no way to make that symmetric: the dependency
+genuinely points in opposite directions. The same is true of the per-channel wasted-bit
+counts, which `PCM`'s bit layout depends on but which the FLAC bitstream only reveals
+inside each subframe header.
+
+Both are handled by one matched pair of one-line primitives at the frame level:
 
 ```c
-static inline void pcm_pre (fctx *c) { if (c->d == DIR_WRITE) pcm_frame(c); }
-static inline void pcm_post(fctx *c) { if (c->d == DIR_READ ) pcm_frame(c); }
+static void sig_xfer(fctx *c) {                 /* ONE copy of the body */
+    for (uint32_t ch = 0; ch < c->channels; ch++)
+        rxfer_wasted(c->geom, c->d, &c->wasted[ch], RC_WASTED);   /* flag + 5 bits, §4.1 */
+    for (uint32_t ch = 0; ch < c->channels; ch++)
+        pcm_block(c, ch, bps_eff(c, ch));
+}
+static inline void sig_pre (fctx *c) { if (c->d == DIR_WRITE) sig_xfer(c); }
+static inline void sig_post(fctx *c) { if (c->d == DIR_READ ) sig_xfer(c); }
 
 bool flac_frame(fctx *c) {
-    bitio_frame_begin(c->fb);                 /* reset running CRC-8 / CRC-16 */
-    flac_frame_header(c);                     /* GEOM: geometry + wasted[]    */
-    pcm_pre(c);                               /* DIR_WRITE: pull sig[][] from PCM */
-    for (ch = 0; ch < c->channels; ch++)
-        flac_subframe(c, ch, bps_eff(c, ch) + c->wasted[ch]);
-    derive_u64(c, 0, bits_to_byte_boundary(c->fb));      /* zero padding      */
-    derive_u64(c, bitio_crc16(c->fb), 16);               /* frame CRC-16      */
-    pcm_post(c);                              /* DIR_READ: push sig[][] to PCM */
+    bitio_frame_begin(c->fb);                       /* reset running CRC-8 / CRC-16      */
+    if (!flac_frame_header(c)) return false;        /* GEOM: geometry codes + CRC-8      */
+    sig_pre(c);                                     /* DIR_WRITE: wasted[] then sig[][]  */
+    for (uint32_t ch = 0; ch < c->channels; ch++)
+        flac_subframe(c, ch);
+    derive_u64(c, 0, bits_to_byte_boundary(c->fb)); /* zero padding, 0..7 bits           */
+    derive_u64(c, bitio_crc16(c->fb), 16);          /* frame CRC-16                      */
+    sig_post(c);                                    /* DIR_READ: wasted[] then sig[][]   */
     return !c->fallback;
 }
 ```
 
-`pcm_frame()` — which walks channels and calls `pcm_block()` — exists in **one** copy; only
-*when* it is called differs. This is a scheduling branch, not a logic branch: no code is
-duplicated and nothing can drift. It is called out here so the auditor can grep for exactly
-these two names and confirm they are the only such pair. Everything else in the walk is
-direction-free.
+`sig_xfer()` exists in **one** copy; only *when* it is called differs. This is a scheduling
+branch, not a logic branch: no code is duplicated, so nothing can drift. It is called out
+here so the auditor can grep for exactly `sig_pre` / `sig_post` and confirm they are the
+only such pair.
 
-`flac_frame_header` is fully symmetric; CRC-8 is a `derive_u64(c, bitio_crc8(c->fb), 8)`
-after the last carried field.
+`flac_frame_header` is fully symmetric — a run of `carry_u` / `carry_bytes` against `GEOM`
+in the §4.1 order, closed by `derive_u64(c, bitio_crc8(c->fb), 8)`.
+
+Note the consequence for cursor order: within a frame, `GEOM` is touched by
+`flac_frame_header` and `sig_xfer`, `PCM` by `sig_xfer`, and `CODE` by `flac_subframe` —
+so `GEOM`, then `PCM`, then `CODE`, exactly as §3.6 requires, with three independent
+sequential cursors and no look-ahead pass over the chunk.
+
 
 ### 5.8 Encode-time verification and rollback
 
@@ -709,49 +808,60 @@ must be designed in from R0 — retrofitting it into an adaptive coder is painfu
 
 ### 6.1 Measured, on CORPUS-NATURAL (`flac -8`)
 
-29 of the 56 files, 26.96 MB, 2 978 frames, 5 956 subframes `[verified]`:
+Two cuts of `/home/user/corpus/natural/` (the stress corpus decoded and re-encoded with
+reference `flac -8`), measured by parsing every frame and adding up the §4 field widths
+`[verified]`:
 
-| | |
-|---|---|
-| Raw recipe (codec 0, no entropy coding) | **355.0 bits/frame**, 177.5 bits/subframe |
-| Recipe as a fraction of the source `.flac` | **0.490 %** |
-| Frame payload | 71 778 bits/frame |
+| Cut | files | frames | raw recipe | % of source `.flac` | payload |
+|---|---:|---:|---:|---:|---:|
+| **CD audio** (01–10: 44.1 kHz, 16-bit, stereo) | 10 | 760 | **262.5 bits/frame** | **0.452 %** | 57 193 bits/frame |
+| **Files 01–29** (adds odd rates, 8/12/20/24-bit, 96 kHz) | 29 | 2 978 | **355.0 bits/frame** | **0.490 %** | 71 778 bits/frame |
 
-Breakdown, bits per frame:
+Breakdown for the CD-audio cut, bits per frame (two subframes per frame):
 
 | Field | bits/frame | % of recipe |
 |---|---:|---:|
-| LPC coefficients | 235.7 | 66.4 |
-| Rice parameters | 43.1 | 12.2 |
-| subframe type codes | 12.0 | 3.4 |
-| coded-number bytes | 9.9 | 2.8 |
-| qlp shift | 9.7 | 2.7 |
-| partition order | 8.0 | 2.3 |
-| qlp precision | 7.7 | 2.2 |
-| blocksize/samplerate/channel/samplesize codes | 15.0 | 4.2 |
-| Rice method | 4.0 | 1.1 |
-| number length, reserved bits, wasted, verbatim flag, extensions | 9.9 | 2.8 |
+| LPC coefficients | 165.6 | 63.1 |
+| Rice parameters | 22.8 | 8.7 |
+| subframe type codes | 12.0 | 4.6 |
+| qlp shift | 9.9 | 3.8 |
+| coded-number bytes | 8.0 | 3.0 |
+| partition order | 8.0 | 3.0 |
+| qlp precision | 7.9 | 3.0 |
+| blocksize / samplerate / channel / samplesize codes | 15.0 | 5.7 |
+| Rice method | 4.0 | 1.5 |
+| number length, reserved bits, wasted flags, `kind` bit, extensions | 9.2 | 3.5 |
+
+The wider 01–29 cut shifts weight further onto LPC coefficients (235.7 b/f, 66.4 %) and
+Rice parameters (43.1 b/f, 12.2 %) because higher bit depths use longer predictors and
+higher partition orders. The shape of the problem does not change.
+
+Note the recipe cost scales with **subframes**, not samples: an 8-channel frame pays ~8×
+the per-subframe cost against ~8× the payload, so the *percentage* is roughly stable, but
+a small-blocksize stream pays the per-frame floor many more times (§6.3).
 
 ### 6.2 Where the bits are, and the honest projection
 
 Two fields are two-thirds of the recipe, and both are compressible:
 
-- **LPC coefficients (236 b/f).** Structured: `qlp[0]` is large and positive, magnitudes
+- **LPC coefficients (166 b/f CD, 236 b/f wider cut — ~64 % of the recipe).** Structured: `qlp[0]` is large and positive, magnitudes
   decay, and successive frames of the same channel are strongly correlated. A context model
   on (coefficient index, precision, previous frame's coefficient) should reach 50–65 % of
   raw. From R4, the decompressor already has the samples when it decodes `CODE`, so it can
   run its own LPC fit and code the *difference* — potentially much better, but unproven.
-- **Rice parameters (43 b/f).** Nearly free from R4: with the samples and the predictor
+- **Rice parameters (23 b/f CD, 43 b/f wider cut).** Nearly free from R4: with the samples and the predictor
   known, the decompressor can compute each partition's optimal parameter and the stored
   value is usually within ±1 of it. Expect 80–90 % reduction.
-- **Everything else (76 b/f)** is near-constant per stream: 85–95 % reduction under a
+- **Everything else (~74 b/f CD, ~76 b/f wider cut)** is near-constant per stream: 85–95 % reduction under a
   simple adaptive model, coded-number included (predict `prev + 1` or `prev + blocksize`
   per §4.3's rule; the delta is 0 almost always).
 
-Projection: **355 → 150–190 bits/frame**, i.e. **0.21–0.26 % of the source `.flac`**. At
+Projection: **262 → 110–140 bits/frame** on CD audio (**0.19–0.24 % of the source
+`.flac`**), **355 → 150–190** on the wider cut. At
 the PLAN's 7 % target that is ~3 % of the win — real, worth R4's attention, and not a
-threat to the target. I do not think it goes much below 140 b/f without predicting LPC
-coefficients from the signal, which is R4 speculation, not a plan.
+threat to the target. I do not believe it goes much below ~110 b/f (CD) without predicting
+LPC coefficients from the decoded signal, which is R4 speculation, not a plan — and if R4
+tries it and fails, the honest outcome is to say so and keep the 0.2 %.
 
 ### 6.3 Two pathological cases worth knowing about
 
@@ -845,7 +955,9 @@ fails; the emitter cannot represent a recomputed residual (hole 21).
 2. Attempt `flac_frame(DIR_READ)` at the cursor, then verify (§5.8).
 3. On success, commit and advance.
 4. On failure, `recio_rewind`, then scan forward from `cursor + 1` for the smallest offset
-   `q` at which a frame parses *and* verifies. Emit `kind = OPAQUE`,
+   `q` at which a frame parses *and* verifies. Only offsets satisfying the cheap sync test
+   (`b[q] == 0xFF && (b[q+1] >> 1) == 0x7C`) need a full attempt, so the scan is a memchr
+   plus a handful of parses, not a parse per byte. Emit `kind = OPAQUE`,
    `run_length = q - cursor`, push those bytes to `VERB`, set `cursor = q`.
 5. If no such `q` exists before EOF, emit one final `OPAQUE` run to EOF (or leave the
    bytes to `S_TRAILER` if no record has been emitted yet in this region).
@@ -877,9 +989,10 @@ Things that are easy to get wrong and that I will review for:
 5. CRC-8 and CRC-16 updated in the byte path of `bitio`, once, shared by both directions;
    CRC-16 starts at the `0xFF` sync byte, CRC-8 covers only the header bytes before it.
 6. `recio_mark` / `recio_rewind` restore model state, not just position — designed in now.
-7. Exactly one `predict()`. Exactly one `pcm_frame()`. Exactly one of each `flac_*`.
-8. The only direction tests in the codebase are in the eight primitives of §5.2 plus
-   `pcm_pre` / `pcm_post`.
+7. Exactly one `predict()`. Exactly one `sig_xfer()`. Exactly one of each `flac_*`.
+8. The only direction tests in the codebase are inside the §5.2 primitives plus
+   `sig_pre` / `sig_post`. Grep for `DIR_READ` / `DIR_WRITE`: every hit must be in one of
+   those.
 9. `GEOM` before `PCM` before `CODE`, always — R4 depends on it.
 10. Do not assert `blocksize <= 65535`; do not assert canonical UTF-8; do not assert the
     reserved header bits are zero (they are carried).
